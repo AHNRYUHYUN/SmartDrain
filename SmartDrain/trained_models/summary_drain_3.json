@@ -1,0 +1,45 @@
+{
+  "drain": 3,
+  "best_model": "cnn1d",
+  "status": "saved",
+  "val_metrics_per_model": {
+    "lstm2": {
+      "val_mae": 0.8193389971231678,
+      "val_rmse": 3.0226519764472872,
+      "val_mase": 1.464957384096803,
+      "val_r2": 0.8346345272359736
+    },
+    "gru2": {
+      "val_mae": 1.4210599772708932,
+      "val_rmse": 3.1361759479779625,
+      "val_mase": 2.5408192631584003,
+      "val_r2": 0.8219797591369812
+    },
+    "cnn1d": {
+      "val_mae": 0.6984542473075315,
+      "val_rmse": 3.431603695846262,
+      "val_mase": 1.2488185117998585,
+      "val_r2": 0.7868610615115748
+    }
+  },
+  "test_metrics": {
+    "mae": 0.24617687390775098,
+    "rmse": 0.3960276357217271,
+    "mape": 4.575047016167109,
+    "smape": 5.517434999906367,
+    "r2": 0.9977712946009988,
+    "mase": 0.440158018221137,
+    "acc_within_2mm": 1.0
+  },
+  "plots": {
+    "metrics_dashboard": null,
+    "test_plot": null,
+    "model_comparison": null,
+    "threshold_forecast": null
+  },
+  "params": {
+    "seq_len": 24,
+    "threshold_mm": 25.0,
+    "forecast_horizon": 72
+  }
+}

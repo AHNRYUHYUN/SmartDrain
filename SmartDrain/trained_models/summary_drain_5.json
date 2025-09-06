@@ -1,0 +1,45 @@
+{
+  "drain": 5,
+  "best_model": "gru2",
+  "status": "saved",
+  "val_metrics_per_model": {
+    "lstm2": {
+      "val_mae": 1.6168341507514319,
+      "val_rmse": 2.793300009282787,
+      "val_mase": 0.2625417267458188,
+      "val_r2": 0.8965424498697961
+    },
+    "gru2": {
+      "val_mae": 1.5032162634034953,
+      "val_rmse": 2.7623295148582363,
+      "val_mase": 0.2440924403303409,
+      "val_r2": 0.8988238866584386
+    },
+    "cnn1d": {
+      "val_mae": 2.4503053118785223,
+      "val_rmse": 3.9916869970611826,
+      "val_mase": 0.3978808756210765,
+      "val_r2": 0.7887289536964214
+    }
+  },
+  "test_metrics": {
+    "mae": 1.938663474309076,
+    "rmse": 3.628207619869541,
+    "mape": 116.18307747067611,
+    "smape": 19.420681005545948,
+    "r2": 0.8254295120717814,
+    "mase": 0.31480041158680505,
+    "acc_within_2mm": 0.7319587628865979
+  },
+  "plots": {
+    "metrics_dashboard": null,
+    "test_plot": null,
+    "model_comparison": null,
+    "threshold_forecast": null
+  },
+  "params": {
+    "seq_len": 24,
+    "threshold_mm": 25.0,
+    "forecast_horizon": 72
+  }
+}
