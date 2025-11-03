@@ -1,20 +1,22 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from django.urls import path
-from .views import update_trash_stats_form, SensorLogsByDrainInfoAPIView, TrainImprovedDrainModelsView,PredictDrainStatusView
+from .views import update_trash_stats_form, SensorLogsByDrainInfoAPIView, TrainImprovedDrainModelsView, \
+    PredictDrainStatusView, RainLogViewSet
 from .views import (
-    SensorLogViewSet, MotorLogViewSet,
+    SensorLogViewSet,
+
     AlertLogViewSet, TrashStatViewSet, PredictionResultViewSet,  DrainInfoViewSet,
-    update_trash_stats_view
 )
 
 router = DefaultRouter()
 router.register(r'sensorlogs', SensorLogViewSet)
-router.register(r'motorlogs', MotorLogViewSet)
 router.register(r'alertlogs', AlertLogViewSet)
 router.register(r'trashstats', TrashStatViewSet)
 router.register(r'predictionresults', PredictionResultViewSet)
 router.register(r'drains', DrainInfoViewSet)
+router.register(r'rain-logs', RainLogViewSet)
+
 
 urlpatterns = [
     path('', include(router.urls)),

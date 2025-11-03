@@ -23,7 +23,7 @@ class DrainInfo(models.Model):
 # 센서 로그
 class SensorLog(models.Model):
     drain = models.ForeignKey(DrainInfo, on_delete=models.CASCADE, verbose_name="하수구 정보")
-    timestamp = models.DateTimeField(verbose_name="측정 시간")
+    timestamp = models.DateTimeField( null=True,verbose_name="측정 시간")
     sensor_type = models.CharField(max_length=50, verbose_name="센서 유형")
     value = models.FloatField(verbose_name="측정 값 (cm, 유무 등)")
 
@@ -36,24 +36,41 @@ class SensorLog(models.Model):
     def __str__(self):
         return f"[{self.timestamp}] {self.sensor_type} @ {self.drain} = {self.value}"
 
+from django.db import models
+from django.utils import timezone
 
-# 모터 작동 로그
-class MotorLog(models.Model):
-    drain = models.ForeignKey(DrainInfo, on_delete=models.CASCADE, verbose_name="하수구 정보")
-    timestamp = models.DateTimeField(verbose_name="작동 시간")
-    trigger_type = models.CharField(max_length=50, verbose_name="작동 트리거 유형")
+# DrainInfo 는 이미 있으시다고 하셔서 참조만 합니다.
+# 같은 app 안에 있다면 문자열로 참조해 순환 import를 피합니다.
+
+from django.db import models
+from django.utils import timezone
+
+class RainLog(models.Model):
+    drain = models.ForeignKey(
+        'DrainInfo',  # 문자열로 참조 가능, app_label.DrainInfo 형태도 가능
+        on_delete=models.CASCADE,
+        verbose_name="하수구 정보"
+    )
+    # 요청 시각을 기본값으로 현재 시간으로 자동 저장
+    timestamp = models.DateTimeField(
+        verbose_name="측정 시간",
+        default=timezone.now,
+        null=True,
+        db_index=True
+    )
+    value = models.FloatField(
+        verbose_name="측정 값 (cm, 유무 등)"
+    )
 
     class Meta:
-        db_table = 'MotorLogs'
-        verbose_name = '모터 로그'
-        verbose_name_plural = '모터 로그 목록'
+        db_table = 'rain'
+        verbose_name = '센서 로그'
+        verbose_name_plural = '센서 로그 목록'
         ordering = ['-timestamp']
 
     def __str__(self):
-        return f"[{self.timestamp}] Motor at {self.drain} triggered by {self.trigger_type}"
+        return f"[{self.timestamp:%Y-%m-%d %H:%M:%S}] drain={self.drain_id} value={self.value}"
 
-
-# 날씨 로그
 
 # 경고 로그
 class AlertLog(models.Model):

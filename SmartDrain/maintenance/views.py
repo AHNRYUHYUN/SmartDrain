@@ -1,45 +1,23 @@
 #views.py
-from .forecast_util import forecast_next_hours
 from .serializers import CleaningTaskSerializer
-from .models import CleaningTask, Crew
 from .services import generate_tasks_for_all_drains
 from .scheduler import greedy_schedule_for_date
-from rest_framework.views import APIView
 from accountapp.models import DrainInfo  # ★ 교체
-from .runtime_assign import runtime_assign_for_date  # ← 추가 import
 from rest_framework.views import APIView
-from rest_framework.response import Response
-from datetime import datetime
-from django.utils import timezone
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
+from rest_framework.generics import ListAPIView, RetrieveAPIView
+from rest_framework.permissions import AllowAny
+from .models import Crew
+from .serializers import CrewSerializer
 
-from datetime import datetime
-from django.utils import timezone
-from django.db import transaction
-   # ← generate 함수가 있는 모듈명에 맞춰 수정
+class CrewListView(ListAPIView):
+    queryset = Crew.objects.all().order_by("id")
+    serializer_class = CrewSerializer
+    permission_classes = [AllowAny]
 
-# views.py (혹은 해당 View가 있는 파일)
-
-from django.db import transaction
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from django.utils import timezone
-from datetime import datetime
-
-#from maintenance.scheduler import greedy_schedule_for_date
-#from maintenance.models import CleaningTask, DrainInfo  # 경로는 프로젝트 구조에 맞게 import
-# from .predictor import generate_tasks_for_all_drains  # 이미 쓰던 함수 import
-
-from datetime import datetime, time, timedelta
-from django.db import transaction
-from django.db.models import DateTimeField, DateField
-from django.utils import timezone
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
+class CrewDetailView(RetrieveAPIView):
+    queryset = Crew.objects.all()
+    serializer_class = CrewSerializer
+    permission_classes = [AllowAny]
 
 def _build_ct_schedule_date_filter(target_date):
     """
@@ -75,7 +53,24 @@ class PredictAndGenerateTasksView(APIView):
         include_forecast: true/false (기본 True)  # (지금은 미사용)
         horizon_hours: int (기본 72)               # (지금은 미사용)
     """
+
     def post(self, request):
+        """
+        모든 배수구에 대해 예측 → 임계 도달 시점 계산 → CleaningTask 생성 → (바로) 당일 스케줄 배정
+        - Zero-Guard(리셋=0 처리) 백스톱 포함
+        - 🔧 수정점:
+            (A) 마지막 원시 값(raw)이 임계 이상이면 즉시 티켓 발급 (현재값 우선 가드)
+            (B) 시간 리샘플 df_h는 마지막 버킷을 원시 마지막 값으로 덮어써 현재값이 0으로 깎이지 않게 함
+        - DB 스키마 변경 없음(기존 필드만 사용)
+        """
+        import numpy as np
+        import pandas as pd
+        from datetime import datetime, timedelta
+        from django.db import transaction
+        from django.utils import timezone
+        from rest_framework import status
+        from rest_framework.response import Response
+
         # ----- 파라미터 -----
         date_str = request.data.get("date")
         overwrite = bool(request.data.get("overwrite"))
@@ -94,8 +89,84 @@ class PredictAndGenerateTasksView(APIView):
 
         body = {"date": str(target_date)}
 
+        # =========================
+        # Zero-Guard 유틸 (내부 함수)
+        # =========================
+        def _extract_post_reset_series(df: pd.DataFrame, value_col="value", min_run=3):
+            """
+            df: index=datetime(1h), column 'value'
+            - 마지막 리셋(==0) 이후 구간만 사용
+            - 고립된 0(앞뒤가 >0인데 가운데만 0)은 NaN 처리
+            - 유효 구간 길이가 min_run 미만이면 빈 Series 반환
+            """
+            if value_col not in df.columns or df.empty:
+                return pd.Series(dtype=float, name=value_col), None
+
+            s = df[value_col].astype(float).copy()
+
+            # (1) 고립된 0 제거
+            s_shift_f = s.shift(-1)
+            s_shift_b = s.shift(1)
+            isolated_zero = (s == 0) & (s_shift_f > 0) & (s_shift_b > 0)
+            s.loc[isolated_zero] = np.nan
+
+            # (2) 마지막 리셋(=0) 인덱스
+            reset_points = s.index[s == 0]
+            last_reset_at = reset_points.max() if len(reset_points) else None
+
+            # (3) 마지막 리셋 이후만 사용
+            if last_reset_at is not None:
+                s = s.loc[s.index > last_reset_at]
+
+            # (4) 짧은 결측 보강(한 칸만)
+            s = s.ffill(limit=1)
+
+            if s.dropna().shape[0] < min_run:
+                return pd.Series(dtype=float, name=value_col), last_reset_at
+
+            s.name = value_col
+            return s, last_reset_at
+
+        def _should_issue_ticket_now(df_hourly: pd.DataFrame,
+                                     latest_raw_value: float = None,
+                                     threshold_mm: float = 25.0,
+                                     hours_ahead: int = 24,
+                                     safety_margin_mm: float = 0.0) -> bool:
+            """
+            임계 도달 여부 판단(Zero-Guard 적용):
+            - (우선) latest_raw_value가 임계-마진 이상이면 즉시 True  ← 🔴 추가
+            - 마지막 리셋 이후 구간만 사용
+            - 현재 값이 임계-마진 이상이면 True
+            - 아니면 최근 기울기 기반 선형외삽으로 hours_ahead 내 임계 도달 예측 시 True
+            """
+            # 🔴 현재 원시값 우선 가드
+            if latest_raw_value is not None and latest_raw_value >= (threshold_mm - safety_margin_mm):
+                return True
+
+            s, _ = _extract_post_reset_series(df_hourly, "value", min_run=3)
+            if s.empty:
+                return False
+
+            cur = float(s.dropna().iloc[-1])
+            if cur >= (threshold_mm - safety_margin_mm):
+                return True
+
+            # 최근 k시간 추세로 외삽
+            k = 6
+            recent = s.dropna().tail(k)
+            if recent.shape[0] >= 2:
+                y = recent.values
+                x = np.arange(len(recent), dtype=float)
+                A = np.vstack([x, np.ones_like(x)]).T
+                m, b = np.linalg.lstsq(A, y, rcond=None)[0]  # y = m x + b
+                y_fore = m * (len(recent) - 1 + hours_ahead) + b
+                if y_fore >= threshold_mm:
+                    return True
+
+            return False
+
         # ===== 1) 예측 → 임계 도달 계산 → CleaningTask 생성 =====
-        # 생성 전/후 ID 차집합으로 '이번 요청에서 새로 만든 작업'만 정확히 집어냄
+        # '이번 요청에서 새로 만든 작업'만 잡기 위한 스냅샷
         before_ids = set(CleaningTask.objects.values_list("id", flat=True))
         try:
             with transaction.atomic():
@@ -112,20 +183,99 @@ class PredictAndGenerateTasksView(APIView):
             "created_count_detected": len(created_ids),
         }
 
+        # ===== 1.1) Zero-Guard 백스톱: 예측/임계 단계에서 누락된 티켓 보강 생성 =====
+        drain_ids_all = set(DrainInfo.objects.values_list("id", flat=True))
+        task_rows = CleaningTask.objects.filter(id__in=created_ids).values("id", "drain_id")
+        drain_ids_already_issued = set(r["drain_id"] for r in task_rows)
+        drain_ids_missing = sorted(list(drain_ids_all - drain_ids_already_issued))
+
+        # 최근 N일 데이터로 오늘 임계 도달 가능성 보수 판정
+        lookback_days = 7
+        start_dt = timezone.make_aware(
+            datetime.combine(target_date - timedelta(days=lookback_days), datetime.min.time()))
+        end_dt = timezone.make_aware(datetime.combine(target_date, datetime.max.time()))
+
+        to_force_issue = []
+        for did in drain_ids_missing:
+            qs = (SensorLog.objects
+                  .filter(drain_id=did, sensor_type='초음파 센서',
+                          timestamp__gte=start_dt, timestamp__lte=end_dt)
+                  .order_by('timestamp')
+                  .values('timestamp', 'value'))
+            if qs.count() < 1:
+                continue
+
+            df = pd.DataFrame.from_records(qs)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.set_index('timestamp').sort_index()
+            # 유효값 범위
+            df = df[(df['value'] >= 0) & (df['value'] <= 30)]
+            if df.empty:
+                continue
+
+            # 🔴 현재 원시 마지막 값 확보 (예: 27이면 바로 True로 갈 수 있게)
+            latest_raw_value = float(df['value'].iloc[-1])
+
+            # 1h 리샘플 (중앙값) + 🔴 마지막 버킷은 원시 마지막 값으로 덮어쓰기
+            df_h = df.resample('1h').median()
+            last_hour = df.index[-1].floor('h')
+            # 마지막 버킷이 존재하면 원시 마지막 값으로 강제 반영 (median에 0 섞여도 현재값 보존)
+            if last_hour in df_h.index:
+                df_h.at[last_hour, 'value'] = latest_raw_value
+            else:
+                # resample 결과에 마지막 시간 인덱스가 없다면 행 추가
+                df_h.loc[last_hour, 'value'] = latest_raw_value
+                df_h = df_h.sort_index()
+
+            # 🔒 제로-가드 판정: (A) 현재 원시값, (B) post-reset 추세
+            if _should_issue_ticket_now(
+                    df_hourly=df_h,
+                    latest_raw_value=latest_raw_value,  # ← 🔴 추가
+                    threshold_mm=25.0,
+                    hours_ahead=24,
+                    safety_margin_mm=0.0
+            ):
+                to_force_issue.append(did)
+
+        forced_task_ids = []
+        if to_force_issue:
+            try:
+                with transaction.atomic():
+                    for did in to_force_issue:
+                        # 당일 동일 하수구 스케줄/티켓 있으면 패스(중복 방지)
+                        date_filter = _build_ct_schedule_date_filter(target_date)
+                        exists = CleaningTask.objects.filter(drain_id=did, **(date_filter or {})).exists()
+                        if exists and not overwrite:
+                            continue
+
+                        # ✅ 스키마 변경 없이 생성(기존 필드만)
+                        ct = CleaningTask.objects.create(
+                            drain_id=did,
+                            title="[AUTO] 임계 도달 예상 (Zero-Guard backstop)",
+                            status="NEW",
+                            due_date=target_date,  # 기존 로직이 due_date 기준이면 그대로 사용
+                        )
+                        forced_task_ids.append(ct.id)
+            except Exception as e:
+                body.setdefault("warnings", []).append(f"Zero-Guard 보강 생성 실패: {e!r}")
+
+        # 생성 리스트에 보강 생성분 합치기
+        if forced_task_ids:
+            created_ids = sorted(list(set(created_ids) | set(forced_task_ids)))
+
         # ===== 1.5) 스케줄 중복 방지 (같은 날짜·같은 하수구 중복 배정 금지) =====
         # 새로 만든 task들의 drain 매핑
         task_rows = CleaningTask.objects.filter(id__in=created_ids).values("id", "drain_id")
         task_to_drain = {r["id"]: r["drain_id"] for r in task_rows}
         drains_in_created = set(task_to_drain.values())
 
-        # CleaningTask 내부에서 "당일에 이미 스케줄된" 동일 하수구가 있는지 확인
+        # 기존 헬퍼로 날짜 필터 구성
         date_filter = _build_ct_schedule_date_filter(target_date)
 
         existing_qs = CleaningTask.objects.filter(drain_id__in=drains_in_created)
         if date_filter:
             existing_qs = existing_qs.filter(**date_filter)
-
-        # (필요 시 상태 제외: 예, 완료/취소 제외)
+        # (필요 시 상태 제외)
         # existing_qs = existing_qs.exclude(status__in=["DONE", "CANCELLED"])
 
         already_scheduled_drains = set(
@@ -149,7 +299,7 @@ class PredictAndGenerateTasksView(APIView):
                 del_qs = CleaningTask.objects.filter(drain_id__in=drains_to_clear)
                 if date_filter:
                     del_qs = del_qs.filter(**date_filter)
-                # 방금 생성된 것까지 혹시 잡히지 않도록 제외
+                # 방금 생성된 것 제외
                 del_qs = del_qs.exclude(id__in=created_ids)
                 del_qs.delete()
             filtered_ids = list(created_ids)
@@ -159,6 +309,8 @@ class PredictAndGenerateTasksView(APIView):
             "already_scheduled_drains": list(already_scheduled_drains),
             "skipped_task_ids": skipped_task_ids,
             "scheduled_task_candidates": filtered_ids,
+            "zero_guard_forced_task_ids": forced_task_ids,
+            "zero_guard_forced_count": len(forced_task_ids),
         }
 
         if not filtered_ids:
@@ -172,10 +324,10 @@ class PredictAndGenerateTasksView(APIView):
             schedules = greedy_schedule_for_date(
                 target_date=target_date,
                 overwrite=overwrite,
-                task_ids=filtered_ids,          # ★ 핵심: 중복 제거된 목록만 스케줄링
+                task_ids=filtered_ids,  # ★ 중복 제거된 목록만
                 assign_all=False,
                 allow_overtime=False,
-                force_assign_remaining=True,   # 생성분을 근무시간/윈도우로 못 넣으면 2차에서라도 넣고 싶으면 True
+                force_assign_remaining=True,
                 # min_gap_min=0,
                 # lunch_break=("12:00","13:00"),
             )
@@ -199,10 +351,9 @@ class PredictAndGenerateTasksView(APIView):
         body["schedules"] = result
         body["overwrite"] = overwrite
 
-        # ===== 3) (옵션) 예측 응답 포함하려면 여기에서 include_forecast/horizon_hours 활용 =====
+        # ===== 3) (옵션) include_forecast/horizon_hours 사용 지점 (현재 미사용) =====
 
         return Response(body, status=status.HTTP_200_OK)
-
 
 
 class TaskListView(APIView):
@@ -449,115 +600,69 @@ class DayRouteGeoJSONView(APIView):
             return Response({"type": "FeatureCollection", "features": features}, status=200)
 
         # maintenance/views.py (예시 목록 API)
+from accountapp.models import SensorLog   # SensorLog가 있는 앱 경로
+from datetime import datetime, date as date_cls, time, timedelta
+from django.db.models import OuterRef, Subquery, DateTimeField, DateField
+# views.py
+from datetime import datetime, date as date_cls, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
 
-
-from datetime import datetime
+from django.apps import apps
+from django.conf import settings
+from django.db import transaction, connection
+from django.db.models import OuterRef, Subquery
 from django.utils import timezone
-from rest_framework.views import APIView
+
 from rest_framework.response import Response
-from rest_framework import status
-#from maintenance.models import CleaningTask
+from rest_framework.views import APIView
+
+# 필요 모델 import (프로젝트 구조에 맞게 경로 조정)
+from .models import CleaningTask, Crew  # 예시: 같은 앱 내 모델일 경우
+# 만약 다른 앱이라면: from core.models import CleaningTask, Crew  등으로 수정
 
 
 # views.py
-from datetime import datetime
-from django.utils import timezone
-from django.db import transaction
-from rest_framework.views import APIView
-from rest_framework.response import Response
 
-# CleaningTask, Crew 는 이 뷰가 속한 앱에 있다고 가정 (필요시 경로 조정)
-from .models import Crew, CleaningTask
-
-# SensorLog 는 "다른 앱"에 있음 (예: smartdrain 앱) → 실제 경로에 맞게 수정하세요.
-from accountapp.models import SensorLog
-
-
-from datetime import datetime
-from django.utils import timezone
-from django.db import transaction
-from rest_framework.views import APIView
-from rest_framework.response import Response
-
-# 프로젝트 경로에 맞게 조정
-from .models import Crew, CleaningTask
-from accountapp.models import SensorLog   # SensorLog가 있는 앱 경로
-
-from datetime import datetime
-from django.utils import timezone
-from django.db import transaction, connection   # ★ connection 추가
-from rest_framework.views import APIView
-from rest_framework.response import Response
-
-from .models import Crew, CleaningTask
-# SensorLog ORM은 사용하지 않으므로 import 불필요 (원하면 남겨도 무방)
-
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-from django.utils import timezone
-from django.db import transaction, connection
-from rest_framework.views import APIView
-from rest_framework.response import Response
-
-# 프로젝트 경로에 맞게 조정
-from .models import Crew, CleaningTask
-
-
-from datetime import datetime, date as date_cls, time, timedelta  # ⬅️ date_cls 추가 임포트
-
-from datetime import datetime, date as date_cls, time, timedelta
-from zoneinfo import ZoneInfo
+import math
+from datetime import datetime, timedelta, date as date_cls
 from decimal import Decimal
-
-from django.apps import apps
-from django.conf import settings
-from django.db import transaction, connection
-from django.db.models import OuterRef, Subquery, DateTimeField, DateField
-from django.utils import timezone
-
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-
-# 실제 경로에 맞게 조정하세요.
-# 예: from core.models import CleaningTask, Crew
-from .models import CleaningTask, Crew
-
-
-from datetime import datetime, date as date_cls, time, timedelta
 from zoneinfo import ZoneInfo
-from decimal import Decimal
 
-from django.apps import apps
 from django.conf import settings
-from django.db import transaction, connection
-from django.db.models import OuterRef, Subquery, DateTimeField, DateField
+from django.apps import apps
+from django.db import connection, transaction
+from django.db.models import OuterRef, Subquery
 from django.utils import timezone
 
-from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework.views import APIView
 
-# 실제 경로에 맞게 조정하세요.
-# 예: from core.models import CleaningTask, Crew
-from .models import CleaningTask, Crew
+# 필요에 맞게 모델 import 경로를 조정하세요.
+# 예시:
+# from .models import Crew, CleaningTask
+from .models import Crew, CleaningTask  # ← 실제 앱으로 변경
 
 
 class CrewTasksView(APIView):
     """
-    GET  /api/crews/tasks?date=YYYY-MM-DD&include_done=false[&crew=팀A|all][&crew_id=1]
+    GET  /api/crews/tasks?date=YYYY-MM-DD&include_done=false[&crew=팀A|all][&crew_id=1][&order=nearest|time|none]
          - crew/crew_id 생략 또는 crew=all 이면 모든 크루를 그룹핑해서 반환
+         - order 파라미터:
+           * nearest(기본): 크루 위치(lat/lng)에서 가까운 작업부터 정렬
+           * time/none: scheduled_start 기준 정렬
 
-    POST /api/crews/tasks?date=YYYY-MM-DD
+    POST /api/crews/tasks?date=YYYY-MM-DD[&order=nearest|time|none]
          body: { "task_id": 222, "when": "2025-09-02T10:20:00+09:00"(옵션) }
          - crew 미지정이어도 해당 날짜 범위에서 task_id 를 찾아 done 처리
          - ✅ done 처리 시, 해당 하수구 센서 로그(SensorLogs)에 ("초음파 센서", 0.0) 1건 추가
            (센서 로그의 timestamp는 항상 '현재 KST'로 저장, 세션 타임존 +09:00 고정)
          - 응답 task 항목에만 risk_score 포함 (요약 X)
+         - ✅ 응답 JSON에서는 각 작업 시작 시간을 최소 2시간(slot) 간격으로 보정(겹치지 않게 표시)
     """
 
     # ---------- helpers ----------
+
     def _parse_date(self, date_str):
         """
         허용 예시:
@@ -632,7 +737,46 @@ class CrewTasksView(APIView):
             dt = timezone.make_aware(dt, timezone.get_current_timezone())
         return timezone.localtime(dt).isoformat()
 
+    # ---------- distance helpers ----------
+
+    def _haversine_km(self, lat1, lng1, lat2, lng2):
+        """위도/경도(도)를 받아 대략적인 구면거리(km) 계산"""
+        if None in (lat1, lng1, lat2, lng2):
+            return float("inf")
+        R = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlng = math.radians(lng2 - lng1)
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng / 2) ** 2)
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return R * c
+
+    def _order_by_nearest(self, start_lat, start_lng, tasks):
+        """
+        단순 '최근접 이웃' 탐욕 알고리즘으로 tasks를 정렬.
+        입력: 모델 인스턴스 리스트(이미 qs → list)
+        반환: 정렬된 리스트
+        """
+        remain = tasks[:]
+        ordered = []
+        cur_lat, cur_lng = start_lat, start_lng
+
+        while remain:
+            best_i = None
+            best_d = float("inf")
+            for i, t in enumerate(remain):
+                d = self._haversine_km(cur_lat, cur_lng, getattr(t, "lat", None), getattr(t, "lng", None))
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            nxt = remain.pop(best_i)
+            ordered.append(nxt)
+            cur_lat = getattr(nxt, "lat", cur_lat)
+            cur_lng = getattr(nxt, "lng", cur_lng)
+        return ordered
+
     # ---------- risk 주입 관련 helpers ----------
+
     def _get_draininfo_model(self):
         """
         DrainInfo 모델 탐색: settings.DRAININFO_MODEL='app_label.ModelName' 이 설정돼 있으면 우선 사용.
@@ -719,10 +863,98 @@ class CrewTasksView(APIView):
             "risk_score": risk_val,  # ← 각 task에만 존재
         }
 
+    # ---------- display spread helper ----------
+
+    def _spread_for_display(self, tasks, slot_hours=2, default_duration_minutes=None):
+        """
+        응답 JSON에서만 작업 시작/끝 시간을 '겹치지 않게' 보정합니다.
+        - slot_hours: 시작 시간 간 최소 간격(기본 2시간)
+        - default_duration_minutes: 작업 시간이 명시되지 않은 경우 사용할 기본 duration
+          (None이면: t.scheduled_end - t.scheduled_start가 유효하면 그걸 쓰고, 없으면 slot_hours를 duration으로 간주)
+        반환: [{"id":..., "start":..., "end":..., ...}, ...]  ← _task_to_dict 형식과 동일
+        """
+        tz = timezone.get_current_timezone()
+        slot = timedelta(hours=slot_hours)
+
+        adjusted = []
+        next_free = None
+
+        for t in tasks:
+            orig_start = t.scheduled_start
+            orig_end = t.scheduled_end
+
+            # timezone aware 보장
+            if timezone.is_naive(orig_start):
+                orig_start = timezone.make_aware(orig_start, tz)
+
+            # duration 계산
+            if orig_end:
+                if timezone.is_naive(orig_end):
+                    orig_end = timezone.make_aware(orig_end, tz)
+                dur = orig_end - orig_start
+                if dur.total_seconds() <= 0:
+                    dur = None
+            else:
+                dur = None
+
+            if default_duration_minutes is not None:
+                dur = timedelta(minutes=default_duration_minutes)
+            elif dur is None:
+                # 명시된 end 없으면 작업 시간이 동일하다는 가정 → slot 을 duration 처럼 사용
+                dur = slot
+
+            # 시작 시간 보정: 이전 작업 시작(next_free)로부터 slot 만큼 띄우기
+            if next_free is None:
+                adj_start = orig_start
+            else:
+                adj_start = max(orig_start, next_free)
+
+            # 다음 작업이 최소 slot 간격 확보되도록 next_free 갱신
+            next_free = adj_start + slot
+
+            adj_end = adj_start + dur
+
+            # dict로 변환 (risk_score 포함 로직 재사용)
+            d = self._task_to_dict_override(t, adj_start, adj_end)
+            adjusted.append(d)
+
+        return adjusted
+
+    def _task_to_dict_override(self, t, start_dt, end_dt):
+        """
+        기존 _task_to_dict 와 동일하되 start/end 를 오버라이드하여 사용.
+        """
+        risk_val = None
+        for name in ("risk_score", "risk", "risk_level"):
+            if hasattr(t, name):
+                val = getattr(t, name)
+                if val is not None:
+                    if isinstance(val, Decimal):
+                        try:
+                            val = float(val)
+                        except Exception:
+                            pass
+                    risk_val = val
+                    break
+
+        return {
+            "id": t.id,
+            "status": t.status,
+            "start": self._iso_local(start_dt),
+            "end": self._iso_local(end_dt),
+            "drain_id": t.drain_id,
+            "lat": t.lat,
+            "lng": t.lng,
+            "risk_score": risk_val,
+        }
+
     # ---------- GET ----------
+
     def get(self, request):
         date_str = request.query_params.get("date")
         include_done = str(request.query_params.get("include_done", "false")).lower() in ("1", "true", "t", "yes", "y")
+        order_mode = (request.query_params.get("order") or "nearest").lower()
+        by_nearest = order_mode in ("nearest", "near", "distance", "dist", "1", "true", "t", "yes", "y")
 
         target_date = self._parse_date(date_str)
         if target_date is None:
@@ -735,19 +967,25 @@ class CrewTasksView(APIView):
             qs = (CleaningTask.objects
                   .filter(assigned_crew_id=crew.id,
                           scheduled_start__gte=day_start,
-                          scheduled_start__lte=day_end)
-                  .order_by("scheduled_start"))
+                          scheduled_start__lte=day_end))
             if not include_done:
                 qs = qs.exclude(status="done")
-            qs = self._annotate_risk(qs)  # 필요 시 risk_score 주입
+            qs = self._annotate_risk(qs)
 
-            data = [self._task_to_dict(t) for t in qs]  # 각 task dict 안에만 risk_score 존재
+            task_list = list(qs)
+            # 거리 기반 정렬 (크루에 lat/lng 필드가 있다고 가정)
+            if by_nearest and getattr(crew, "lat", None) is not None and getattr(crew, "lng", None) is not None:
+                task_list = self._order_by_nearest(crew.lat, crew.lng, task_list)
+            else:
+                task_list.sort(key=lambda t: t.scheduled_start or day_start)
+
+            tasks = self._spread_for_display(task_list, slot_hours=2)  # ← 시작 2시간 간격 보정
 
             return Response({
                 "date": str(target_date),
                 "crew_mode": "single",
                 "crew": {"id": crew.id, "name": getattr(crew, "name", str(crew.id))},
-                "tasks": data
+                "tasks": tasks
             }, status=200)
 
         # 전체 크루
@@ -757,13 +995,18 @@ class CrewTasksView(APIView):
             qs = (CleaningTask.objects
                   .filter(assigned_crew_id=c.id,
                           scheduled_start__gte=day_start,
-                          scheduled_start__lte=day_end)
-                  .order_by("scheduled_start"))
+                          scheduled_start__lte=day_end))
             if not include_done:
                 qs = qs.exclude(status="done")
             qs = self._annotate_risk(qs)
 
-            items = [self._task_to_dict(t) for t in qs]  # 각 task dict 안에만 risk_score 존재
+            task_list = list(qs)
+            if by_nearest and getattr(c, "lat", None) is not None and getattr(c, "lng", None) is not None:
+                task_list = self._order_by_nearest(c.lat, c.lng, task_list)
+            else:
+                task_list.sort(key=lambda t: t.scheduled_start or day_start)
+
+            items = self._spread_for_display(task_list, slot_hours=2)  # ← 보정 적용
             grouped.append({
                 "crew": {"id": c.id, "name": getattr(c, "name", str(c.id))},
                 "tasks": items
@@ -777,6 +1020,7 @@ class CrewTasksView(APIView):
         }, status=200)
 
     # ---------- POST ----------
+
     def post(self, request):
         """
         body: { "task_id": <int>, "when": <ISO8601>(옵션) }
@@ -784,6 +1028,8 @@ class CrewTasksView(APIView):
         """
         date_str = request.query_params.get("date")
         include_done = str(request.query_params.get("include_done", "false")).lower() in ("1", "true", "t", "yes", "y")
+        order_mode = (request.query_params.get("order") or "nearest").lower()
+        by_nearest = order_mode in ("nearest", "near", "distance", "dist", "1", "true", "t", "yes", "y")
 
         target_date = self._parse_date(date_str)
         if target_date is None:
@@ -843,12 +1089,19 @@ class CrewTasksView(APIView):
             qs = (CleaningTask.objects
                   .filter(assigned_crew_id=crew.id,
                           scheduled_start__gte=day_start,
-                          scheduled_start__lte=day_end)
-                  .order_by("scheduled_start"))
+                          scheduled_start__lte=day_end))
             if not include_done:
                 qs = qs.exclude(status="done")
-            qs = self._annotate_risk(qs)  # 필요 시 risk_score 주입
-            tasks = [self._task_to_dict(t) for t in qs]
+            qs = self._annotate_risk(qs)
+            task_list = list(qs)
+
+            if by_nearest and getattr(crew, "lat", None) is not None and getattr(crew, "lng", None) is not None:
+                task_list = self._order_by_nearest(crew.lat, crew.lng, task_list)
+            else:
+                task_list.sort(key=lambda t: t.scheduled_start or day_start)
+
+            tasks = self._spread_for_display(task_list, slot_hours=2)
+
             return Response({
                 "date": str(target_date),
                 "crew_mode": "single",
@@ -864,12 +1117,19 @@ class CrewTasksView(APIView):
             qs = (CleaningTask.objects
                   .filter(assigned_crew_id=c.id,
                           scheduled_start__gte=day_start,
-                          scheduled_start__lte=day_end)
-                  .order_by("scheduled_start"))
+                          scheduled_start__lte=day_end))
             if not include_done:
                 qs = qs.exclude(status="done")
-            qs = self._annotate_risk(qs)  # 필요 시 risk_score 주입
-            items = [self._task_to_dict(t) for t in qs]
+            qs = self._annotate_risk(qs)
+
+            task_list = list(qs)
+            if by_nearest and getattr(c, "lat", None) is not None and getattr(c, "lng", None) is not None:
+                task_list = self._order_by_nearest(c.lat, c.lng, task_list)
+            else:
+                task_list.sort(key=lambda t: t.scheduled_start or day_start)
+
+            items = self._spread_for_display(task_list, slot_hours=2)
+
             grouped.append({
                 "crew": {"id": c.id, "name": getattr(c, "name", str(c.id))},
                 "tasks": items

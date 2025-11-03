@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import SensorLog, MotorLog, AlertLog, TrashStat, PredictionResult, DrainInfo
+from .models import SensorLog,  AlertLog, TrashStat, PredictionResult, DrainInfo
 
 
 class DrainInfoSerializer(serializers.ModelSerializer):
@@ -14,11 +14,23 @@ class SensorLogSerializer(serializers.ModelSerializer):
             '__all__'
 
 
-class MotorLogSerializer(serializers.ModelSerializer):
+
+from rest_framework import serializers
+from django.utils import timezone
+from .models import RainLog
+
+class RainLogSerializer(serializers.ModelSerializer):
+    # timestamp를 읽기 전용으로 해서 클라이언트가 값 못 넣게 하고,
+    # 생성 시에는 서버 시간(now)으로 저장되도록 합니다.
+    timestamp = serializers.DateTimeField(read_only=True)
+
     class Meta:
-        model = MotorLog
-        fields = \
-            '__all__'
+        model = RainLog
+        fields = ['id', 'drain', 'timestamp', 'value']
+
+    def create(self, validated_data):
+        validated_data['timestamp'] = timezone.now()
+        return super().create(validated_data)
 
 
 

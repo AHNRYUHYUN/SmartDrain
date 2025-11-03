@@ -4,7 +4,7 @@ from .views import (
     PredictAndGenerateTasksView,
     TaskListView,
     DaySchedulePreviewView, PredictDebugView, DayScheduleDetailedView, DayRouteGeoJSONView,
-    CrewTasksView,
+    CrewTasksView, CrewListView, CrewDetailView,
 )
 
 
@@ -31,6 +31,9 @@ urlpatterns = [
     path("crews/tasks", CrewTasksView.as_view(), name="crew-tasks"),  # GET(전체/단일) + POST(완료)
 
     path('api/accountapp/', include('accountapp.urls')),
+
+    path("crews/", CrewListView.as_view(), name="crew-list"),
+    path("crews/<int:pk>/", CrewDetailView.as_view(), name="crew-detail"),
 ]
 
 

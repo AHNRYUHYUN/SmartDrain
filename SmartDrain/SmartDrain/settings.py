@@ -48,7 +48,7 @@ INSTALLED_APPS = [
 
 # 청소 임계 방향/값
 DRAIN_THRESHOLD_MODE = 'B'   # 'A' => 값이 작아질수록 위험, 'B' => 값이 커질수록 위험
-DRAIN_THRESHOLD_VALUE = 20.0  # MODE=A면 <= 5.0 이면 청소 필요, MODE=B면 >= 5.0
+DRAIN_THRESHOLD_VALUE = 15.0  # MODE=A면 <= 5.0 이면 청소 필요, MODE=B면 >= 5.0
 DRAIN_LEAD_HOURS = 6         # 임계 도달 전 얼마 전에 끝내야 하는지(시간)
 SCHEDULER_AVG_SPEED_KMH = 30 # 이동속도(단순화)
 PREDICTION_HORIZON_HOURS = 24

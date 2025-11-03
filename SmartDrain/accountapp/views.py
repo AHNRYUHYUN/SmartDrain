@@ -8,13 +8,12 @@ PLOT_SUBDIR = "plots"  # 모델 폴더 하위 plots 디렉터리
 
 
 from rest_framework import viewsets
-from .models import SensorLog, MotorLog, AlertLog, TrashStat, PredictionResult, DrainInfo
+from .models import SensorLog,AlertLog
 from .serializers import (
-    SensorLogSerializer, MotorLogSerializer,
-    AlertLogSerializer, TrashStatSerializer, PredictionResultSerializer, DrainInfoSerializer
+    SensorLogSerializer,
+
+    AlertLogSerializer, TrashStatSerializer, DrainInfoSerializer
 )
-import joblib
-from rest_framework.views import APIView
 from .models import PredictionResult
 from .serializers import PredictionResultSerializer
 from django.http import JsonResponse
@@ -30,6 +29,50 @@ from django.db.models import Avg, Max
 from rest_framework.response import Response
 from rest_framework import status
 
+from rest_framework import viewsets, filters
+from rest_framework.permissions import AllowAny
+from .models import RainLog
+from .serializers import RainLogSerializer
+
+class RainLogViewSet(viewsets.ModelViewSet):
+    queryset = RainLog.objects.all()
+    serializer_class = RainLogSerializer
+    permission_classes = [AllowAny]  # 필요에 따라 IsAuthenticated 등으로 변경
+    filter_backends = [filters.OrderingFilter]
+    ordering = ['-timestamp']  # 기본 정렬
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        # /api/rain-logs/?drain=1 식으로 특정 하수구 필터 가능
+        drain_id = self.request.query_params.get('drain')
+        if drain_id:
+            qs = qs.filter(drain_id=drain_id)
+        return qs
+class SensorLogViewSet(viewsets.ModelViewSet):
+    queryset = SensorLog.objects.all()
+    serializer_class = SensorLogSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        name = self.request.query_params.get('name')
+        sensor_type = self.request.query_params.get('sensor_type')
+
+        # 이름으로 drain 필터링
+        if name:
+            queryset = queryset.filter(drain__name=name)
+
+        # 센서 유형으로 필터링
+        if sensor_type:
+            queryset = queryset.filter(sensor_type=sensor_type)
+
+        return queryset
+
+    def post(self, request):
+        serializer = SensorLogSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 class DrainInfoViewSet(viewsets.ModelViewSet):
     queryset = DrainInfo.objects.all()
     serializer_class = DrainInfoSerializer
@@ -41,6 +84,9 @@ class DrainInfoViewSet(viewsets.ModelViewSet):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         self.perform_create(serializer)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+
 
 
 #센서값 입력 코드   센서타입 다 분할하기
@@ -71,26 +117,12 @@ class SensorLogViewSet(viewsets.ModelViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-class MotorLogViewSet(viewsets.ModelViewSet):
-    queryset = MotorLog.objects.all()
-    serializer_class = MotorLogSerializer
-
 
 
 class AlertLogViewSet(viewsets.ModelViewSet):
     queryset = AlertLog.objects.all()
     serializer_class = AlertLogSerializer
 
-
-#센서 값 반환해주는 코드
-# views.py
-
-from datetime import timedelta, timezone as dt_timezone
-from zoneinfo import ZoneInfo
-from django.conf import settings
-from django.utils import timezone
-from rest_framework.views import APIView
-from rest_framework.response import Response
 from rest_framework import status, serializers
 
 from .models import DrainInfo, SensorLog
@@ -329,99 +361,158 @@ class PredictDrainStatusView(APIView):
         return Response(result, status=200)
 
 #모델 학습 코드
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os, glob, logging
+import numpy as np
+import pandas as pd
+import joblib
+
+from django.conf import settings
+from django.utils import timezone
+from rest_framework.views import APIView
+from rest_framework.response import Response
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# ✅ 서버/헤드리스에서도 PNG 저장되도록
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, GRU, Dense, Dropout, Conv1D, GlobalAveragePooling1D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# 실제 앱 경로로 변경하세요
+from accountapp.models import DrainInfo, SensorLog
 
 
-# ===== Imports =====
 import os
-
-import matplotlib
-matplotlib.use("Agg")
-
-
-# ===== Imports =====
-import logging
-
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-# 프로젝트 모델
-from .models import DrainInfo, SensorLog
-
-logger = logging.getLogger(__name__)
-
-
-# ===== Imports =====
-import logging
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-# 프로젝트 모델
-from .models import DrainInfo, SensorLog
-
-logger = logging.getLogger(__name__)
-
-
-# ===== Imports =====
-import logging
-
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-from .models import DrainInfo, SensorLog
-
-logger = logging.getLogger(__name__)
-
-
-import logging
-
-
-logger = logging.getLogger(__name__)
-
-# ===== Imports =====
+import glob
+import json
 import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import joblib
 
-from django.utils import timezone
 from django.conf import settings
-
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
 
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import joblib
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.losses import Huber
+from tensorflow.keras import Sequential, Input
+from tensorflow.keras.layers import LSTM, GRU, Dense, Dropout, Conv1D, GlobalAveragePooling1D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
+# 프로젝트 모델 (경로 환경에 맞게 조정)
 from .models import DrainInfo, SensorLog
 
-logger = logging.getLogger(__name__)
+
+def _maybe_enable_mixed_precision():
+    """GPU가 있으면 mixed_float16 적용 (CPU만 있으면 제외)"""
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            from tensorflow.keras import mixed_precision
+            mixed_precision.set_global_policy("mixed_float16")
+            return "mixed_float16"
+        except Exception:
+            pass
+    return "float32"
+
+
+def _maybe_enable_xla():
+    """가능한 환경에서 XLA JIT 시도 (안되면 무시)."""
+    try:
+        tf.config.optimizer.set_jit(True)
+        return True
+    except Exception:
+        return False
+
+
+# -*- coding: utf-8 -*-
+# TrainImprovedDrainModelsView: 정확도/로스만 JSON으로 리턴 + 시각화(base64) + (옵션) PNG 파일 저장
+import os, io, json, base64, logging
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  # 서버 환경에서 GUI 없이 렌더
+import matplotlib.pyplot as plt
+
+import joblib
+import tensorflow as tf
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import (
+    Input, Dense, Dropout, LSTM, GRU, Conv1D, GlobalAveragePooling1D,
+    LayerNormalization, BatchNormalization
+)
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.losses import Huber
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from django.conf import settings
+from django.utils import timezone
+from rest_framework.views import APIView
+from rest_framework.response import Response
+
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+
+# 필요에 맞게 실제 경로로 수정하세요.
+#   예) from drains.models import DrainInfo, SensorLog
+from .models import DrainInfo, SensorLog
+
+
+# === 런타임 가속 옵션 ===
+def _maybe_enable_mixed_precision() -> str:
+    """
+    GPU가 있으면 mixed_float16 정책을 적용합니다. (TF 2.10 호환)
+    """
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            from tensorflow.keras import mixed_precision
+            policy = mixed_precision.Policy("mixed_float16")
+            mixed_precision.set_global_policy(policy)
+            return "mixed_float16"
+    except Exception:
+        pass
+    return "float32"
+
+
+def _maybe_enable_xla() -> bool:
+    """
+    가능한 경우 XLA JIT을 활성화합니다.
+    """
+    try:
+        tf.config.optimizer.set_jit(True)
+        return True
+    except Exception:
+        return False
 
 
 # -*- coding: utf-8 -*-
 from pathlib import Path
-import json
+import os, glob, logging
 import numpy as np
 import pandas as pd
 import joblib
-import matplotlib.pyplot as plt
 
 from django.conf import settings
 from django.utils import timezone
@@ -431,47 +522,44 @@ from rest_framework.response import Response
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# 모델/데이터 의존 모델은 프로젝트에 맞게 import 하세요.
-# 예시)
-from accountapp.models import DrainInfo
-from accountapp.models import SensorLog  # 실제 앱 경로에 맞게 수정
+# ✅ 서버/헤드리스에서도 PNG 저장되도록
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-# 텐서플로/케라스
-from tensorflow.keras import Sequential
-from tensorflow.keras.layers import (
-    LSTM, GRU, Dense, Dropout, Conv1D, GlobalAveragePooling1D, InputLayer
-)
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, LSTM, GRU, Dense, Dropout, Conv1D, GlobalAveragePooling1D
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
+# 실제 앱 경로로 변경하세요
+from accountapp.models import DrainInfo, SensorLog
 
 class TrainImprovedDrainModelsView(APIView):
     """
-    초음파 전용 + cleaning_flag 포함 LSTM/GRU/CNN 예측 (멀티모델 비교)
-    - 리셋(값=0)으로 사이클 분할, 사이클 내부에서만 시퀀스 생성
-    - 입력: height_scaled, cleaning_flag(현재 시점이 리셋=1), [추후 외부변수 확장 지점]
-    - 모델 후보: LSTM(2층), GRU(2층), 1D-CNN(Conv1D+GAP)
-    - 손실: MSE(Adam)
-    - 산출물(기본): metrics_dashboard_drain_{id}.png (성능 지표 대시보드)
-    - 옵션: 타임라인형 테스트 플롯, 모델비교 플롯, 임계도달 롤링 예측 플롯
+    - 초음파 전용 + cleaning_flag 포함 시계열 예측
+    - 멀티모델(LSTM/GRU/CNN1D) 비교, 베스트 선정
+    - 산출물: 발표용 PNG들 (정확도 강조 대시보드 + 학습진행 그래프 등)
+    - JSON 파일 생성하지 않음
     """
 
-    # ===== 표시/출력 플래그 =====
-    SHOW_PERFORMANCE_ONLY = True     # 성능 지표 대시보드만 출력
-    GENERATE_TEST_TIMELINE = False   # 테스트 구간 시간축 그래프 (실측/예측 + 리셋 이벤트)
+    # ===== 출력/옵션 =====
+    SHOW_PERFORMANCE_ONLY = True
+    GENERATE_TEST_TIMELINE = False
     GENERATE_MODEL_COMPARISON = False
     GENERATE_THRESHOLD_FORECAST = False
 
-    # ===== 하이퍼파라미터 / 경로 =====
+    # ===== 경로/하이퍼파라미터 =====
+    MODEL_DIR = Path(getattr(settings, "BASE_DIR", Path("."))) / "trained_models"
+
     SAVE_ONLY_IF_BETTER = True
     BEAT_RATIO = 0.95
 
-    SEQ_LEN = 24  # 24시간 컨텍스트
+    SEQ_LEN = 24
     SENSOR_HEIGHT = '초음파 센서'
-    USE_CLEANING_FLAG = True  # 리셋(=0) 시점 표시 feature 사용
-    MODEL_DIR = Path(getattr(settings, "BASE_DIR", Path("."))) / "trained_models"
+    USE_CLEANING_FLAG = True
 
-    # 멀티모델
     MODEL_KINDS = ["lstm2", "gru2", "cnn1d"]
     LEARNING_RATE = 1e-3
     EPOCHS = 180
@@ -481,9 +569,31 @@ class TrainImprovedDrainModelsView(APIView):
     MIN_LR = 1e-5
     DROPOUT = 0.2
 
-    # 임계 도달 예측(롤링)
     THRESHOLD_MM = 25.0
-    FORECAST_HORIZON = 72  # 시간 스텝 수(=1H 기준 72시간)
+    FORECAST_HORIZON = 72
+
+    # ===== 내부 콜백: 에포크별 검증 지표 수집 =====
+    class _ValMetricsCallback(tf.keras.callbacks.Callback):
+        def __init__(self, X_va, y_va, scaler, tol_mm=2.0):
+            super().__init__()
+            self.X_va = X_va
+            self.y_va = y_va
+            self.scaler = scaler
+            self.tol_mm = tol_mm
+            self.history = {"val_loss": [], "val_rmse": [], "val_mae": [], "val_acc2": []}
+
+        def on_epoch_end(self, epoch, logs=None):
+            logs = logs or {}
+            self.history["val_loss"].append(float(logs.get("val_loss", np.nan)))
+            y_pred_scaled = self.model(self.X_va, training=False).numpy()
+            y_true = self.scaler.inverse_transform(self.y_va).flatten()
+            y_pred = self.scaler.inverse_transform(y_pred_scaled).flatten()
+            rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+            mae  = float(np.mean(np.abs(y_true - y_pred)))
+            acc2 = float(np.mean(np.abs(y_true - y_pred) <= self.tol_mm)) if len(y_true) else 0.0
+            self.history["val_rmse"].append(rmse)
+            self.history["val_mae"].append(mae)
+            self.history["val_acc2"].append(acc2)
 
     # ===== 유틸 =====
     @staticmethod
@@ -515,14 +625,7 @@ class TrainImprovedDrainModelsView(APIView):
 
     # ----- 피처 구성 -----
     def _build_features(self, df_h):
-        """
-        df_h: index=datetime(1H), column 'value' (mm), 0 = reset
-        반환: feat_mat (N,F), values_raw (N,), scaler
-              F = 1(height_scaled) + [1(cleaning_flag)]
-        """
         values = df_h['value'].to_numpy(dtype=float)
-
-        # 스케일러(양수만)
         pos_vals = values[(~np.isnan(values)) & (values > 0)]
         scaler = MinMaxScaler()
         if len(pos_vals) >= 2 and (np.max(pos_vals) - np.min(pos_vals) > 1e-12):
@@ -535,24 +638,16 @@ class TrainImprovedDrainModelsView(APIView):
         scaled_all[mask_valid] = scaler.transform(values[mask_valid].reshape(-1, 1)).reshape(-1)
 
         feat_list = [scaled_all.reshape(-1, 1)]
-
         if self.USE_CLEANING_FLAG:
             cleaning_flag = (df_h['value'] == 0).astype(float).to_numpy().reshape(-1, 1)
             feat_list.append(cleaning_flag)
 
-        # TODO: 외부 변수(강수량 등) 추가 시 여기서 병합하여 feat_list.append(...)
-        feat_mat = np.concatenate(feat_list, axis=1)  # (N,F)
+        feat_mat = np.concatenate(feat_list, axis=1)
         return feat_mat, values, scaler
 
     # ----- 사이클 내부 시퀀스 -----
     @staticmethod
     def _create_sequences_cycle(feat_mat, raw_height, seq_len=24):
-        """
-        - 리셋(0) 경계를 기준으로 사이클 분할
-        - 사이클 내부에서만 (seq_len+1) 윈도우 생성
-        - NaN/0 포함 윈도우 제외
-        반환: X:(M,seq_len,F), y:(M,1)  (y는 '다음 시점 height_scaled')
-        """
         X, y = [], []
         raw = np.asarray(raw_height, dtype=float)
         feats = np.asarray(feat_mat, dtype=float)
@@ -566,11 +661,9 @@ class TrainImprovedDrainModelsView(APIView):
             start = bounds[b] + 1
             end = bounds[b + 1]
             seg_len = end - start + 1
-            if seg_len < seq_len + 1:
-                continue
+            if seg_len < seq_len + 1: continue
             fseg = feats[start:end + 1]
             rseg = raw[start:end + 1]
-
             for i in range(seg_len - seq_len):
                 wr = rseg[i:i + seq_len + 1]
                 wf = fseg[i:i + seq_len + 1]
@@ -585,7 +678,8 @@ class TrainImprovedDrainModelsView(APIView):
 
     # ----- 모델 빌더 -----
     def _build_model(self, kind, input_shape):
-        model = Sequential([InputLayer(input_shape=input_shape)])
+        model = Sequential()
+        model.add(Input(shape=input_shape))
         if kind == "lstm2":
             model.add(LSTM(64, return_sequences=True))
             model.add(Dropout(self.DROPOUT))
@@ -609,7 +703,6 @@ class TrainImprovedDrainModelsView(APIView):
             model.add(Dense(1, activation="linear"))
         else:
             raise ValueError(f"unknown model kind: {kind}")
-
         model.compile(optimizer=Adam(learning_rate=self.LEARNING_RATE), loss="mse")
         return model
 
@@ -630,103 +723,124 @@ class TrainImprovedDrainModelsView(APIView):
             "y_true": y_true, "y_pred": y_pred
         }
 
-    # ----- 성능 지표 대시보드 저장 -----
+    # ----- PNG 저장 공용 함수 -----
+    def _save_figure_png(self, fig, out_path: Path):
+        self.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(str(out_path), format="png", dpi=130)
+        plt.close(fig)
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError(f"failed to save figure: {out_path}")
+        logging.info(f"[PNG SAVED] {out_path} ({out_path.stat().st_size} bytes)")
+        return out_path
+
+    # ----- 발표용 대시보드 (정확도 강조) -----
     def _save_metrics_dashboard(self, drain_id, metrics_per_model, best_kind):
-        """
-        metrics_per_model: dict[kind] = {"rmse":..., "mae":..., "mase":..., "r2":..., "acc2":... (선택)}
-        """
         out = self.MODEL_DIR / f"metrics_dashboard_drain_{drain_id}.png"
-
         kinds = list(metrics_per_model.keys())
-        cols = ["RMSE", "MAE", "MASE", "R²"]
-        has_acc2 = any("acc2" in v for v in metrics_per_model.values())
-        if has_acc2:
-            cols.append("Acc≤2mm")
+        cols = ["RMSE", "MAE", "MASE", "R²", "Acc≤2mm"]
 
-        # 테이블 데이터 구성 (소수 3자리)
-        table_data = []
+        table_data, rmse, mae, mase, accp = [], [], [], [], []
         for k in kinds:
-            row = [
-                f"{metrics_per_model[k]['rmse']:.3f}",
-                f"{metrics_per_model[k]['mae']:.3f}",
-                f"{metrics_per_model[k]['mase']:.3f}",
-                f"{metrics_per_model[k]['r2']:.3f}",
-            ]
-            if has_acc2:
-                row.append(f"{metrics_per_model[k]['acc2']*100:.1f}%")
-            table_data.append(row)
+            v = metrics_per_model[k]
+            table_data.append([
+                f"{v['rmse']:.3f}",
+                f"{v['mae']:.3f}",
+                f"{v['mase']:.3f}",
+                f"{v['r2']:.3f}",
+                f"{(v.get('acc2',0.0)*100):.1f}%"
+            ])
+            rmse.append(v["rmse"]); mae.append(v["mae"]); mase.append(v["mase"]); accp.append(v.get("acc2",0.0)*100)
 
-        # 바차트용 배열
-        rmse = [metrics_per_model[k]["rmse"] for k in kinds]
-        mae  = [metrics_per_model[k]["mae"]  for k in kinds]
-        mase = [metrics_per_model[k]["mase"] for k in kinds]
+        fig = plt.figure(figsize=(9.6, 7.4), dpi=130)
 
-        fig = plt.figure(figsize=(8.5, 7.0), dpi=120)
-
-        # ---- 상단: 테이블 ----
-        ax1 = fig.add_axes([0.05, 0.58, 0.9, 0.37])
-        ax1.axis('off')
+        # 상단 테이블
+        ax1 = fig.add_axes([0.05, 0.55, 0.9, 0.4]); ax1.axis('off')
         the_table = ax1.table(
             cellText=table_data,
             rowLabels=[f"{k} {'★' if k==best_kind else ''}" for k in kinds],
-            colLabels=cols,
-            loc='center',
-            cellLoc='center'
+            colLabels=cols, loc='center', cellLoc='center'
         )
-        the_table.auto_set_font_size(False)
-        the_table.set_fontsize(9)
-        the_table.scale(1, 1.3)
-        ax1.set_title(f"드레인 {drain_id} — 모델별 성능 지표")
+        the_table.auto_set_font_size(False); the_table.set_fontsize(10); the_table.scale(1.0, 1.35)
+        ax1.set_title(f"드레인 {drain_id} — 모델별 성능 요약 (정확도 강조)", fontsize=14, weight="bold")
 
-        # ---- 하단: 가로 바차트 : MASE, RMSE, MAE 비교 ----
-        ax2 = fig.add_axes([0.08, 0.08, 0.84, 0.42])
-        y = np.arange(len(kinds))
-        h = 0.22
-        ax2.barh(y + 0.24, mase, height=h, label="MASE")
-        ax2.barh(y + 0.00, rmse, height=h, label="RMSE")
-        ax2.barh(y - 0.24, mae,  height=h, label="MAE")
-        ax2.set_yticks(y)
-        ax2.set_yticklabels(kinds)
-        ax2.invert_yaxis()
-        ax2.grid(axis='x', alpha=0.25)
-        ax2.legend(loc="lower right", framealpha=0.9)
-        ax2.set_xlabel("값이 낮을수록 좋음")
-        ax2.set_title("핵심 지표 비교 (낮을수록 좋음)")
+        # 하단 막대
+        ax2 = fig.add_axes([0.08, 0.12, 0.84, 0.36])
+        x = np.arange(len(kinds)); w = 0.2
+        ax2.bar(x - 1.5*w, rmse, width=w, label="RMSE(↓)")
+        ax2.bar(x - 0.5*w, mae,  width=w, label="MAE(↓)")
+        ax2.bar(x + 0.5*w, mase, width=w, label="MASE(↓)")
+        ax2.bar(x + 1.5*w, accp, width=w, label="정확도 Acc≤2mm % (↑)")
+        ax2.set_xticks(x); ax2.set_xticklabels(kinds)
+        ax2.grid(axis="y", alpha=0.25); ax2.legend(loc="best", framealpha=0.9)
+        ax2.set_ylabel("값(오차는 낮을수록, 정확도는 높을수록 좋음)")
+        ax2.set_title("핵심 지표 비교", fontsize=13)
 
-        # 베스트 모델 강조 라인
+        # 베스트 강조
+        best_acc = metrics_per_model[best_kind].get("acc2", 0.0) * 100
+        ax2.text(0.98, 0.98, f"Best {best_kind}\n정확도 {best_acc:.1f}%",
+                 transform=ax2.transAxes, ha="right", va="top",
+                 fontsize=12, weight="bold", color="tab:blue",
+                 bbox=dict(boxstyle="round,pad=0.5", facecolor="white", alpha=0.8, lw=0.6))
         try:
             best_idx = kinds.index(best_kind)
-            ax2.axhline(best_idx, xmin=0.0, xmax=1.0, linewidth=1.0, linestyle='--', alpha=0.6)
+            ax2.axvline(best_idx, ymin=0, ymax=1, linestyle='--', alpha=0.35)
         except Exception:
             pass
 
-        fig.tight_layout()
-        fig.savefig(str(out), format="png")
-        plt.close(fig)
-        return out
+        return self._save_figure_png(fig, out)
 
-    # ----- (옵션) 테스트 플롯 저장 -----
-    def _save_test_plot(self, drain_id, y_true, y_pred,
-                        rmse, mae, mase):
-        self.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        file_path = self.MODEL_DIR / f"model_drain_{drain_id}_test.png"
+    # ----- 학습진행 그래프(요청 이미지 느낌) -----
+    def _save_training_progress(self, drain_id, kind, mon_history):
+        out = self.MODEL_DIR / f"training_progress_drain_{drain_id}_{kind}.png"
+        epochs = np.arange(1, len(mon_history["val_loss"]) + 1)
 
+        fig = plt.figure(figsize=(10.5, 7.0), dpi=130)
+
+        # 상단 대패널: RMSE & MAE
+        ax_top = fig.add_axes([0.08, 0.58, 0.84, 0.34])
+        ax_top.plot(epochs, mon_history["val_rmse"], linewidth=2.2, label="val RMSE")
+        ax_top.plot(epochs, mon_history["val_mae"],  linewidth=2.0, alpha=0.7, label="val MAE")
+        ax_top.set_title("Model Performance", fontsize=13, weight="bold")
+        ax_top.set_xlabel("Epochs"); ax_top.set_ylabel("Error")
+        ax_top.grid(alpha=0.25); ax_top.legend(loc="best", framealpha=0.9)
+
+        # 좌하: Loss
+        ax1 = fig.add_axes([0.08, 0.10, 0.26, 0.29])
+        ax1.plot(epochs, mon_history["val_loss"], linewidth=2.0)
+        ax1.set_title("Val Loss"); ax1.set_xlabel("Epochs"); ax1.set_ylabel("Loss"); ax1.grid(alpha=0.25)
+
+        # 중하: MAE
+        ax2 = fig.add_axes([0.37, 0.10, 0.26, 0.29])
+        ax2.plot(epochs, mon_history["val_mae"], linewidth=2.0)
+        ax2.set_title("Val MAE"); ax2.set_xlabel("Epochs"); ax2.set_ylabel("MAE"); ax2.grid(alpha=0.25)
+
+        # 우하: Acc(≤2mm)
+        ax3 = fig.add_axes([0.66, 0.10, 0.26, 0.29])
+        acc_percent = [v * 100.0 for v in mon_history["val_acc2"]]
+        ax3.plot(epochs, acc_percent, linewidth=2.0)
+        ax3.set_title("Accuracy (≤2mm)"); ax3.set_xlabel("Epochs"); ax3.set_ylabel("%"); ax3.grid(alpha=0.25)
+
+        fig.suptitle(f"Training Progress — Drain {drain_id} / {kind}", y=0.98, fontsize=14, weight="bold")
+        self._save_figure_png(fig, out)
+        return str(out)
+
+    # ----- (옵션) 테스트 플롯 -----
+    def _save_test_plot(self, drain_id, y_true, y_pred, rmse, mae, mase):
+        out = self.MODEL_DIR / f"model_drain_{drain_id}_test.png"
         x = np.arange(len(y_true))
         y_true = np.asarray(y_true, dtype=float)
         y_pred = np.asarray(y_pred, dtype=float)
 
-        fig, ax = plt.subplots(figsize=(7.2, 3.8), dpi=120)
-
-        # 상승(쌓이는) 구간만 선으로 연결
+        fig, ax = plt.subplots(figsize=(8.2, 4.2), dpi=130)
         y_line = y_true.copy()
         for i in range(len(y_line) - 1):
             if (y_true[i + 1] - y_true[i]) < 0:
                 y_line[i + 1] = np.nan
         ax.plot(x, y_line, linewidth=1.8, label="실측(상승)")
-        ax.fill_between(x, 0, y_line, where=~np.isnan(y_line), alpha=0.20, step=None, label="_nolegend_")
+        ax.fill_between(x, 0, y_line, where=~np.isnan(y_line), alpha=0.18, step=None, label="_nolegend_")
         ax.plot(x, y_true, linestyle='None', marker='o', markersize=3, label="_nolegend_")
 
-        # 리셋(하강) 이벤트
         dy = np.diff(y_true)
         drop_idx = np.where(dy < 0)[0] + 1
         if len(drop_idx) > 0:
@@ -734,111 +848,77 @@ class TrainImprovedDrainModelsView(APIView):
                 ax.vlines(i, 0, y_true[i], linestyles='dashed', linewidth=1.0, alpha=0.6)
             ax.plot(drop_idx, y_true[drop_idx], linestyle='None', marker='v', markersize=5, alpha=0.9, label="리셋")
 
-        # 예측
         ax.plot(x, y_pred, linestyle='--', linewidth=1.6, marker='o', markersize=2.5, label="예측", alpha=0.95)
-
         ax.set_title(f"드레인 {drain_id} — 테스트: 실측/예측 & 리셋 이벤트")
-        ax.set_xlabel("샘플(시간 순)")
-        ax.set_ylabel("높이 (mm)")
-        ax.grid(alpha=0.25)
-        ax.legend(loc="best", framealpha=0.9)
+        ax.set_xlabel("샘플(시간 순)"); ax.set_ylabel("높이 (mm)")
+        ax.grid(alpha=0.25); ax.legend(loc="best", framealpha=0.9)
 
-        ymin = float(np.nanmin([y_true.min(), y_pred.min()]))
-        ymax = float(np.nanmax([y_true.max(), y_pred.max()]))
-        pad = max(1.0, (ymax - ymin) * 0.08)
-        ax.set_ylim(ymin - pad, ymax + pad)
+        pad = max(1.0, (float(np.nanmax([y_true.max(), y_pred.max()])) - float(np.nanmin([y_true.min(), y_pred.min()]))) * 0.08)
+        ax.set_ylim(float(np.nanmin([y_true.min(), y_pred.min()])) - pad,
+                    float(np.nanmax([y_true.max(), y_pred.max()])) + pad)
 
-        txt = (f"RMSE {rmse:.3f}\n"
-               f"MAE  {mae:.3f}\n"
-               f"MASE {mase:.3f}")
+        txt = (f"RMSE {rmse:.3f}\nMAE  {mae:.3f}\nMASE {mase:.3f}")
         ax.text(0.02, 0.98, txt, transform=ax.transAxes, va="top", ha="left",
                 fontsize=9, bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, linewidth=0.5))
 
-        fig.tight_layout()
-        fig.savefig(str(file_path), format="png")
-        plt.close(fig)
-        return file_path
+        return self._save_figure_png(fig, out)
 
     # ----- (옵션) 모델 비교 플롯 -----
     def _save_model_comparison_plot(self, drain_id, metrics_per_model):
         out = self.MODEL_DIR / f"models_comparison_drain_{drain_id}.png"
         kinds = list(metrics_per_model.keys())
         rmse = [metrics_per_model[k]["rmse"] for k in kinds]
-        mae  = [metrics_per_model[k]["mae"] for k in kinds]
+        mae  = [metrics_per_model[k]["mae"]  for k in kinds]
         mase = [metrics_per_model[k]["mase"] for k in kinds]
         r2   = [metrics_per_model[k]["r2"] for k in kinds]
 
-        fig, ax = plt.subplots(figsize=(7.2, 3.8), dpi=120)
-        x = np.arange(len(kinds))
-        w = 0.2
+        fig, ax = plt.subplots(figsize=(8.2, 4.2), dpi=130)
+        x = np.arange(len(kinds)); w = 0.2
         ax.bar(x - 1.5*w, rmse, width=w, label="RMSE")
         ax.bar(x - 0.5*w, mae,  width=w, label="MAE")
         ax.bar(x + 0.5*w, mase, width=w, label="MASE")
         ax.bar(x + 1.5*w, r2,   width=w, label="R²")
         ax.set_xticks(x); ax.set_xticklabels(kinds)
         ax.set_title(f"드레인 {drain_id} — 모델 비교 지표")
-        ax.grid(axis="y", alpha=0.25)
-        ax.legend()
-        fig.tight_layout()
-        fig.savefig(str(out), format="png")
-        plt.close(fig)
-        return out
+        ax.grid(axis="y", alpha=0.25); ax.legend()
+        return self._save_figure_png(fig, out)
 
     # ----- (옵션) 롤링 예측 & 임계 도달 시점 -----
     def _rollout_and_threshold(self, model, latest_block_feats, scaler, threshold_mm, horizon):
-        """
-        latest_block_feats: (seq_len, F) — 마지막 유효 시퀀스(리셋/NaN 없이)
-        반환: dict { "forecast_mm": [..], "reach_index": int|None }
-        """
-        seq = latest_block_feats.copy()
+        seq = latest_block_feats.astype('float32').copy()
         preds_scaled = []
         for _ in range(horizon):
-            x_in = seq[np.newaxis, :, :]
-            y_next_scaled = model.predict(x_in, verbose=0)  # (1,1)
-            preds_scaled.append(y_next_scaled.item())
-            # 다음 입력 업데이트: height_scaled만 갱신, 나머지 피처(예: cleaning_flag)는 0 가정
-            next_feat = seq[-1].copy()
-            next_feat[0] = y_next_scaled.item()
-            if len(next_feat) > 1:
-                next_feat[1:] = 0.0
-            seq = np.vstack([seq[1:], next_feat])
+            x_in = seq[np.newaxis, :, :].astype('float32')
+            y_next_scaled = model(x_in, training=False).numpy()
+            preds_scaled.append(float(y_next_scaled.item()))
+            nf = seq[-1].copy()
+            nf[0] = float(y_next_scaled.item())
+            if len(nf) > 1: nf[1:] = 0.0
+            seq = np.vstack([seq[1:], nf])
 
-        forecast_mm = scaler.inverse_transform(np.array(preds_scaled).reshape(-1,1)).flatten().tolist()
-
-        reach_index = None
-        for i, v in enumerate(forecast_mm):
-            if v >= threshold_mm:
-                reach_index = i
-                break
+        forecast_mm = self._inverse_transform_column(scaler, np.array(preds_scaled, dtype='float32').reshape(-1,1)).flatten().tolist()
+        reach_index = next((i for i, v in enumerate(forecast_mm) if v >= threshold_mm), None)
         return {"forecast_mm": forecast_mm, "reach_index": reach_index}
 
-    def _save_threshold_plot(self, drain_id, last_value_mm, forecast_mm, reach_index):
-        out = self.MODEL_DIR / f"forecast_threshold_drain_{drain_id}.png"
-        x = np.arange(len(forecast_mm))
-        fig, ax = plt.subplots(figsize=(7.2, 3.8), dpi=120)
-        ax.plot(x, forecast_mm, marker='o', linewidth=1.6, label="롤링 예측(mm)")
-        ax.hlines(self.THRESHOLD_MM, xmin=0, xmax=len(x)-1, linestyles='dashed', linewidth=1.2, label=f"임계 {self.THRESHOLD_MM}mm")
-        ax.plot(0, last_value_mm, marker='s', label="현재", linestyle='None')
-
-        if reach_index is not None:
-            ax.vlines(reach_index, 0, max(self.THRESHOLD_MM, max(forecast_mm)), linestyles='dotted', linewidth=1.2, label="도달 시점")
-            ax.text(reach_index, self.THRESHOLD_MM, f" +{reach_index}h ", va='bottom', ha='center')
-
-        ax.set_title(f"드레인 {drain_id} — 임계 도달 롤링 예측")
-        ax.set_xlabel("미래 시간(h)")
-        ax.set_ylabel("예측 높이 (mm)")
-        ax.grid(alpha=0.25)
-        ax.legend(loc="best", framealpha=0.9)
-        fig.tight_layout(); fig.savefig(str(out), format="png"); plt.close(fig)
-        return out
+    @staticmethod
+    def _inverse_transform_column(scaler, arr2d):
+        # sklearn MinMaxScaler inverse_transform는 2D 입력 기대
+        return scaler.inverse_transform(arr2d)
 
     # ===== 메인 =====
     def post(self, request):
-        # 프리플라이트
+        # 폴더/권한/청소(JSON 사용 안 함)
         preflight = {"model_dir": str(self.MODEL_DIR), "ok": True, "error": None}
         try:
             self.MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            t = self.MODEL_DIR / "._w.tmp"; t.write_text("ok"); t.unlink(missing_ok=True)
+            # 혹시 남아있던 summary_drain_*.json 정리
+            for p in glob.glob(str(self.MODEL_DIR / "summary_drain_*.json")):
+                try: os.remove(p)
+                except: pass
+            # 쓰기 확인
+            test_path = self.MODEL_DIR / "._w.tmp"
+            with open(test_path, "w", encoding="utf-8") as f: f.write("ok")
+            os.remove(test_path)
         except Exception as e:
             preflight["ok"] = False; preflight["error"] = repr(e)
 
@@ -847,7 +927,7 @@ class TrainImprovedDrainModelsView(APIView):
 
         for drain in drains:
             try:
-                # ---- 초음파 로그 ----
+                # ---- 데이터 ----
                 qs = SensorLog.objects.filter(drain=drain, sensor_type=self.SENSOR_HEIGHT).order_by('timestamp')
                 if qs.count() < 50:
                     results.append({"drain": drain.id, "status": "데이터 부족"}); continue
@@ -855,11 +935,8 @@ class TrainImprovedDrainModelsView(APIView):
                 df = pd.DataFrame.from_records(qs.values('timestamp', 'value'))
                 df['timestamp'] = pd.to_datetime(df['timestamp'])
                 df.set_index('timestamp', inplace=True)
-
-                # 값 범위 (0~30). 0은 리셋
                 df = df[(df['value'] >= 0) & (df['value'] <= 30)]
-                # 1H 중앙값 리샘플
-                df = df.resample('1H').median()
+                df = df.resample('1h').median()  # 소문자 'h'
 
                 # 세그 내부 1칸 결측만 ffill, 리셋은 0 유지
                 v = df['value'].copy()
@@ -872,172 +949,139 @@ class TrainImprovedDrainModelsView(APIView):
                 if len(df) < self.SEQ_LEN + 30:
                     results.append({"drain": drain.id, "status": "유효 샘플 부족"}); continue
 
-                # ----- 피처 & 스케일러 -----
+                # ---- 피처/시퀀스 ----
                 feat_mat, values_raw, scaler = self._build_features(df)
-
-                # ----- 시퀀스(사이클 내부) -----
                 X, y_next_scaled = self._create_sequences_cycle(feat_mat, values_raw, seq_len=self.SEQ_LEN)
                 if len(X) < 30:
                     results.append({"drain": drain.id, "status": "시퀀스 부족(사이클 내)"}); continue
 
-                # 시간 순서 split
+                # split
                 n = len(X)
                 i_tr = int(n * 0.70)
                 i_va = int(n * 0.85)
                 X_tr, y_tr = X[:i_tr], y_next_scaled[:i_tr]
                 X_va, y_va = X[i_tr:i_va], y_next_scaled[i_tr:i_va]
                 X_te, y_te = X[i_va:],    y_next_scaled[i_va:]
-
                 if len(X_va) < 10 or len(X_te) < 10:
                     results.append({"drain": drain.id, "status": "검증/테스트 부족"}); continue
 
-                # ----- 멀티 모델 학습/평가 -----
+                # dtype 고정(retracing 완화)
+                X_tr = X_tr.astype('float32'); y_tr = y_tr.astype('float32')
+                X_va = X_va.astype('float32'); y_va = y_va.astype('float32')
+                X_te = X_te.astype('float32'); y_te = y_te.astype('float32')
+
+                # ---- 학습/검증 ----
                 metrics_map = {}
                 model_objs = {}
-                history_map = {}
+                per_model_progress = {}
 
                 for kind in self.MODEL_KINDS:
                     model = self._build_model(kind, input_shape=(X.shape[1], X.shape[2]))
                     es = EarlyStopping(monitor='val_loss', patience=self.PATIENCE_ES, restore_best_weights=True)
                     rl = ReduceLROnPlateau(monitor='val_loss', patience=self.PATIENCE_RLR, factor=0.5,
                                            min_lr=self.MIN_LR, verbose=0)
+                    mon = self._ValMetricsCallback(X_va, y_va, scaler, tol_mm=2.0)
 
-                    h = model.fit(
+                    model.fit(
                         X_tr, y_tr,
                         validation_data=(X_va, y_va),
                         epochs=self.EPOCHS, batch_size=self.BATCH_SIZE,
-                        callbacks=[es, rl], verbose=0
+                        callbacks=[es, rl, mon],
+                        verbose=0
                     )
 
-                    # 검증 지표(선정용)
-                    y_va_pred_scaled = model.predict(X_va, verbose=0)
+                    # 검증 성능(선정/표시)
+                    y_va_pred_scaled = model(X_va, training=False).numpy()
                     m_va = self._evaluate_metrics(scaler, y_tr, y_va, y_va_pred_scaled)
                     metrics_map[kind] = {
-                        "val_mae": m_va["mae"], "val_rmse": m_va["rmse"], "val_mase": m_va["mase"], "val_r2": m_va["r2"]
+                        "val_mae": m_va["mae"], "val_rmse": m_va["rmse"],
+                        "val_mase": m_va["mase"], "val_r2": m_va["r2"],
+                        "val_acc2": m_va.get("acc_within_2mm", 0.0)
                     }
                     model_objs[kind] = model
-                    history_map[kind] = {"loss": list(h.history.get("loss", [])),
-                                         "val_loss": list(h.history.get("val_loss", []))}
 
-                # 베스트 모델 선정 (val MASE → val RMSE)
-                def sort_key(k):
-                    return (metrics_map[k]["val_mase"], metrics_map[k]["val_rmse"])
+                    # 학습진행 그래프 저장
+                    try:
+                        per_model_progress[kind] = self._save_training_progress(drain.id, kind, mon.history)
+                    except Exception as e:
+                        logging.exception(f"training progress save failed: drain={drain.id} kind={kind} err={e!r}")
+                        per_model_progress[kind] = None
+
+                # 베스트 선정 (val MASE -> val RMSE)
+                def sort_key(k): return (metrics_map[k]["val_mase"], metrics_map[k]["val_rmse"])
                 best_kind = sorted(self.MODEL_KINDS, key=sort_key)[0]
                 best_model = model_objs[best_kind]
 
-                # ----- 테스트 평가 (베스트 모델) -----
-                y_te_pred_scaled = best_model.predict(X_te, verbose=0)
+                # ---- 테스트 성능(베스트) ----
+                y_te_pred_scaled = best_model(X_te, training=False).numpy()
                 m_te = self._evaluate_metrics(scaler, y_tr, y_te, y_te_pred_scaled)
                 y_true = m_te["y_true"]; y_pred = m_te["y_pred"]
 
-                # 저장 정책(나이브 대비)
+                # 저장 여부(나이브 대비)
                 naive_pred = scaler.inverse_transform(X_te[:, -1, 0:1]).flatten()
                 naive_rmse = float(np.sqrt(mean_squared_error(y_true, naive_pred)))
                 naive_mae  = float(mean_absolute_error(y_true, naive_pred))
                 beats = (m_te["mase"] <= 1.0 * self.BEAT_RATIO) or \
                         ((m_te["rmse"] <= naive_rmse * self.BEAT_RATIO) and (m_te["mae"] <= naive_mae * self.BEAT_RATIO))
 
-                model_path  = self.MODEL_DIR / f"model_drain_{drain.id}.h5"
+                # 모델/스케일러 저장(.keras)
+                model_path  = self.MODEL_DIR / f"model_drain_{drain.id}.keras"
                 scaler_path = self.MODEL_DIR / f"scaler_drain_{drain.id}.pkl"
                 status_msg = "saved" if ((not self.SAVE_ONLY_IF_BETTER) or beats) else "skipped (baseline better/close)"
                 if status_msg == "saved":
                     if model_path.exists(): model_path.unlink()
                     if scaler_path.exists(): scaler_path.unlink()
-                    best_model.save(str(model_path)); joblib.dump(scaler, str(scaler_path))
+                    best_model.save(str(model_path))
+                    joblib.dump(scaler, str(scaler_path))
 
-                # ----- 성능 대시보드 지표 구성 -----
-                # 테스트 기준 대시보드(권장): 베스트는 테스트 지표, 나머지는 검증 지표 사용
+                # ---- 대시보드 입력(정확도 포함) ----
                 metrics_for_dashboard = {}
                 for k in self.MODEL_KINDS:
                     if k == best_kind:
                         metrics_for_dashboard[k] = {
-                            "rmse": m_te["rmse"], "mae": m_te["mae"], "mase": m_te["mase"], "r2": m_te["r2"],
+                            "rmse": m_te["rmse"], "mae": m_te["mae"],
+                            "mase": m_te["mase"], "r2": m_te["r2"],
                             "acc2": m_te.get("acc_within_2mm", 0.0)
                         }
                     else:
                         metrics_for_dashboard[k] = {
                             "rmse": metrics_map[k]["val_rmse"], "mae": metrics_map[k]["val_mae"],
                             "mase": metrics_map[k]["val_mase"], "r2": metrics_map[k]["val_r2"],
+                            "acc2": metrics_map[k]["val_acc2"]
                         }
 
-                # ----- 산출물 저장 -----
-                test_plot_path = None
-                comp_plot_path = None
-                forecast_plot_path = None
-                metrics_dashboard_path = None
-
-                try:
-                    metrics_dashboard_path = str(self._save_metrics_dashboard(
-                        drain.id, metrics_for_dashboard, best_kind
-                    ))
-                except Exception:
-                    import logging; logging.exception("metrics dashboard save failed")
+                # ---- PNG 저장 ----
+                md_path = str(self._save_metrics_dashboard(drain.id, metrics_for_dashboard, best_kind))
+                test_plot_path = comp_plot_path = forecast_plot_path = None
 
                 if not self.SHOW_PERFORMANCE_ONLY:
                     if self.GENERATE_TEST_TIMELINE:
-                        try:
-                            test_plot_path = str(self._save_test_plot(
-                                drain.id, y_true, y_pred,
-                                m_te["rmse"], m_te["mae"], m_te["mase"]
-                            ))
-                        except Exception:
-                            import logging; logging.exception("test plot save failed")
-
+                        test_plot_path = str(self._save_test_plot(
+                            drain.id, y_true, y_pred,
+                            m_te["rmse"], m_te["mae"], m_te["mase"]
+                        ))
                     if self.GENERATE_MODEL_COMPARISON:
-                        try:
-                            comp_plot_path = str(self._save_model_comparison_plot(
-                                drain.id,
-                                {k: {"rmse": metrics_for_dashboard[k]["rmse"],
-                                     "mae": metrics_for_dashboard[k]["mae"],
-                                     "mase": metrics_for_dashboard[k]["mase"],
-                                     "r2": metrics_for_dashboard[k]["r2"]} for k in self.MODEL_KINDS}
-                            ))
-                        except Exception:
-                            import logging; logging.exception("comparison plot save failed")
-
+                        comp_plot_path = str(self._save_model_comparison_plot(
+                            drain.id,
+                            {k: {"rmse": metrics_for_dashboard[k]["rmse"],
+                                 "mae": metrics_for_dashboard[k]["mae"],
+                                 "mase": metrics_for_dashboard[k]["mase"],
+                                 "r2": metrics_for_dashboard[k]["r2"]} for k in self.MODEL_KINDS}
+                        ))
                     if self.GENERATE_THRESHOLD_FORECAST:
-                        try:
-                            last_block = feat_mat[-self.SEQ_LEN:, :]  # (seq_len,F)
-                            last_raw = values_raw[-self.SEQ_LEN:]
-                            if (not np.any(np.isnan(last_block))) and (not np.any(last_raw == 0)):
-                                roll = self._rollout_and_threshold(
-                                    best_model, last_block, scaler,
-                                    threshold_mm=self.THRESHOLD_MM, horizon=self.FORECAST_HORIZON
-                                )
-                                last_val_mm = float(values_raw[-1])
-                                forecast_plot_path = str(self._save_threshold_plot(
-                                    drain.id, last_val_mm, roll["forecast_mm"], roll["reach_index"]
-                                ))
-                        except Exception:
-                            import logging; logging.exception("threshold forecast failed")
+                        last_block = feat_mat[-self.SEQ_LEN:, :]
+                        last_raw = values_raw[-self.SEQ_LEN:]
+                        if (not np.any(np.isnan(last_block))) and (not np.any(last_raw == 0)):
+                            roll = self._rollout_and_threshold(
+                                best_model, last_block, scaler,
+                                threshold_mm=self.THRESHOLD_MM, horizon=self.FORECAST_HORIZON
+                            )
+                            last_val_mm = float(values_raw[-1])
+                            forecast_plot_path = str(self._save_threshold_plot(
+                                drain.id, last_val_mm, roll["forecast_mm"], roll["reach_index"]
+                            ))
 
-                # ----- summary JSON 저장 -----
-                try:
-                    summary = {
-                        "drain": drain.id,
-                        "best_model": best_kind,
-                        "status": status_msg,
-                        "val_metrics_per_model": metrics_map,
-                        "test_metrics": {k: m_te[k] for k in ["mae","rmse","mape","smape","r2","mase","acc_within_2mm"]},
-                        "plots": {
-                            "metrics_dashboard": metrics_dashboard_path,
-                            "test_plot": test_plot_path,
-                            "model_comparison": comp_plot_path,
-                            "threshold_forecast": forecast_plot_path
-                        },
-                        "params": {
-                            "seq_len": self.SEQ_LEN,
-                            "threshold_mm": self.THRESHOLD_MM,
-                            "forecast_horizon": self.FORECAST_HORIZON
-                        }
-                    }
-                    summ_path = self.MODEL_DIR / f"summary_drain_{drain.id}.json"
-                    with open(summ_path, "w", encoding="utf-8") as f:
-                        json.dump(summary, f, ensure_ascii=False, indent=2)
-                except Exception:
-                    import logging; logging.exception("summary json save failed")
-
-                # ----- 응답 결과 -----
+                # ---- 응답(JSON은 파일경로/지표만; 별도 요약 JSON 저장 없음) ----
                 results.append({
                     "drain": drain.id,
                     "status": status_msg,
@@ -1047,20 +1091,24 @@ class TrainImprovedDrainModelsView(APIView):
                     "count_train": int(len(X_tr)),
                     "count_val": int(len(X_va)),
                     "count_test": int(len(X_te)),
-                    "val_metrics": metrics_map.get(best_kind, {}),
                     "test_metrics": {k: m_te[k] for k in ["mae","rmse","mape","smape","r2","mase","acc_within_2mm"]},
                     "plots": {
-                        "metrics_dashboard": metrics_dashboard_path,
-                        # 성능 지표만 원하면 아래 세 개는 None로 둡니다.
-                        "test_plot": test_plot_path,
-                        "model_comparison": comp_plot_path,
-                        "threshold_forecast": forecast_plot_path
+                        "metrics_dashboard": md_path,
+                        "training_progress": per_model_progress.get(best_kind),  # 베스트 모델 진행 그래프
+                        "test_plot": test_plot_path if not self.SHOW_PERFORMANCE_ONLY else None,
+                        "model_comparison": comp_plot_path if not self.SHOW_PERFORMANCE_ONLY else None,
+                        "threshold_forecast": forecast_plot_path if not self.SHOW_PERFORMANCE_ONLY else None
                     },
                 })
 
             except Exception as e:
-                import logging; logging.exception(f"Unexpected error for drain {drain.id}")
-                results.append({"drain": drain.id, "status": f"error: {e!r}"})
+                logging.exception(f"Unexpected error for drain {getattr(drain,'id','?')}")
+                results.append({"drain": getattr(drain,'id',None), "status": f"error: {e!r}"})
+
+        # 혹시 외부 코드가 만든 summary JSON이 있다면 마무리 청소(선택)
+        for p in glob.glob(str(self.MODEL_DIR / "summary_drain_*.json")):
+            try: os.remove(p)
+            except: pass
 
         return Response({
             "preflight": preflight,
